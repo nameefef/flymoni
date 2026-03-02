@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Elite Flight Systems - Pro PFD</title>
+    <style>
+        :root {
+            --neon: #00ff66;
+            --warn: #ff3300;
+            --panel: #121214;
+        }
+
+        body {
+            margin: 0; background: #000; color: #fff;
+            font-family: 'Segoe UI', 'Consolas', monospace;
+            display: flex; height: 100vh; overflow: hidden;
+        }
+
+        /* 侧边数据监测栏 */
+        #sidebar {
+            width: 260px; background: var(--panel); border-right: 2px solid #222;
+            display: flex; flex-direction: column; padding: 20px; box-sizing: border-box;
+            z-index: 10;
+        }
+
+        .data-box {
+            background: rgba(255,255,255,0.03); border: 1px solid #333;
+            padding: 12px; margin-bottom: 12px; border-radius: 4px;
+        }
+        .label { font-size: 10px; color: #888; text-transform: uppercase; margin-bottom: 4px; }
+        .value { font-size: 24px; color: var(--neon); font-weight: 300; }
+        .unit { font-size: 12px; color: #444; margin-left: 4px; }
+
+        /* 主显示区 */
+        #viewport {
+            flex-grow: 1; position: relative; display: flex;
+            align-items: center; justify-content: center;
+        }
+
+        canvas { border: 4px solid #1a1a1a; border-radius: 8px; box-shadow: 0 0 60px #000; }
+
+        /* 警报与坠毁界面 */
+        #master-warn {
+            position: absolute; top: 15%; background: var(--warn); color: #fff;
+            padding: 10px 40px; font-weight: 900; font-size: 24px; border: 2px solid #fff;
+            display: none; animation: blink 0.4s infinite; z-index: 100;
+        }
+
+        #crash-overlay {
+            position: absolute; inset: 0; background: rgba(0,0,0,0.95);
+            display: none; flex-direction: column; align-items: center; justify-content: center;
+            z-index: 200; color: var(--warn); text-align: center;
+        }
+
+        /* 控制按钮 */
+        #controls {
+            position: absolute; bottom: 30px; display: flex; gap: 10px; flex-wrap: wrap;
+        }
+        button {
+            background: #222; color: #eee; border: 1px solid #444; padding: 12px 20px;
+            cursor: pointer; border-radius: 4px; font-size: 13px; font-weight: bold;
+        }
+        button:active { transform: scale(0.95); }
+        .btn-main { background: var(--neon); color: #000; border: none; }
+
+        @keyframes blink { 50% { opacity: 0; } }
+
+        @media (max-width: 700px) {
+            #sidebar { width: 140px; padding: 10px; }
+            .value { font-size: 18px; }
+            canvas { width: 95vw; height: 95vw; }
+        }
+    </style>
+</head>
+<body>
+
+<div id="sidebar">
+    <div style="font-size: 14px; color: #555; margin-bottom: 20px; font-weight: bold;">AVIONICS MONITOR</div>
+    
+    <div class="data-box">
+        <div class="label">ALT 高度 (北斗)</div>
+        <div class="value"><span id="ui-alt">----</span><span class="unit">M</span></div>
+    </div>
+    <div class="data-box">
+        <div class="label">SPD 空速 (GPS)</div>
+        <div class="value"><span id="ui-speed">0.0</span><span class="unit">KT</span></div>
+    </div>
+    <div class="data-box">
+        <div class="label">HDG 航向</div>
+        <div class="value"><span id="ui-hdg">000</span><span class="unit">°</span></div>
+    </div>
+    <div class="data-box">
+        <div class="label">PITCH 俯仰</div>
+        <div class="value" id="ui-pitch">0.0<span class="unit">°</span></div>
+    </div>
+    <div class="data-box">
+        <div class="label">ROLL 滚转</div>
+        <div class="value" id="ui-roll">0.0<span class="unit">°</span></div>
+    </div>
+
+    <div style="margin-top: auto; font-size: 10px; color: #444;">
+        SYS: <span id="st-sensor" style="color:red">OFFLINE</span><br>
+        PAD: <span id="st-pad" style="color:red">DISCON</span>
+    </div>
+</div>
+
+<div id="viewport">
+    <div id="master-warn">SINK RATE / PULL UP</div>
+    
+    <div id="crash-overlay">
+        <h1 style="font-size: 60px; margin-bottom: 10px;">CRASHED</h1>
+        <p>地表撞击或姿态解体</p>
+        <button onclick="location.reload()" class="btn-main" style="margin-top: 30px;">重启系统</button>
+    </div>
+
+    <canvas id="pfd" width="600" height="600"></canvas>
+
+    <div id="controls">
+        <button class="btn-main" onclick="initFlight()">启动系统 (授权音频/传感器)</button>
+        <button onclick="calibrate()">一键配平 (TRIM)</button>
+        <button onclick="state.mute = !state.mute">警报音测试/开关</button>
+    </div>
+</div>
+
+<script>
+    const canvas = document.getElementById('pfd');
+    const ctx = canvas.getContext('2d');
+    
+    let state = {
+        pitch: 0, roll: 0, hdg: 0,
+        v_pitch: 0, v_roll: 0,
+        speed: 160, alt: 3500,
+        trimP: 0, trimR: 0,
+        mute: false, isCrashed: false, hasPad: false
+    };
+
+    let audioCtx;
+
+    // --- 1. 系统启动与音频解锁 ---
+    async function initFlight() {
+        // 显式激活 Web Audio API
+        if (!audioCtx) {
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (audioCtx.state === 'suspended') {
+            await audioCtx.resume();
+        }
+
+        // 测试音频并解锁
+        playAlarmTone(200, 0.01); 
+
+        // 传感器授权
+        if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+            const res = await DeviceOrientationEvent.requestPermission();
+            if (res === 'granted') window.addEventListener('deviceorientation', handleGyro);
+        } else {
+            window.addEventListener('deviceorientation', handleGyro);
+        }
+
+        // 北斗/GPS 数据
+        navigator.geolocation.watchPosition(pos => {
+            state.speed = (pos.coords.speed || 0) * 1.943; // m/s to Knots
+            state.alt = pos.coords.altitude || 3500;
+            document.getElementById('st-sensor').innerText = "ONLINE";
+            document.getElementById('st-sensor').style.color = "var(--neon)";
+        }, null, { enableHighAccuracy: true });
+
+        requestAnimationFrame(physicsEngine);
+    }
+
+    // --- 2. 核心物理引擎 (处理真实反馈) ---
+    function physicsEngine() {
+        if (state.isCrashed) return;
+
+        // 手柄控制检测
+        const pads = navigator.getGamepads();
+        if (pads[0]) {
+            state.hasPad = true;
+            state.pitch = -pads[0].axes[1] * 45;
+            state.roll = pads[0].axes[0] * 60;
+            document.getElementById('st-pad').innerText = "ACTIVE";
+        }
+
+        // --- 不动手柄时的真实反应 ---
+        // A. 模拟随机气流抖动
+        let turbulence = (Math.random() - 0.5) * 0.12;
+        
+        // B. 发动机扭矩 (不操作飞机会缓慢左偏)
+        let torque = 0.012; 
+
+        // C. 应用物理惯性
+        state.v_pitch += turbulence + (-state.pitch * 0.015); // 自动回正倾向
+        state.v_roll += turbulence + torque;
+        
+        state.v_pitch *= 0.95; // 空气阻尼
+        state.v_roll *= 0.94;
+
+        state.pitch += state.v_pitch;
+        state.roll += state.v_roll;
+
+        // D. 能量耦合：拉头掉速，下压增速
+        state.speed -= (state.pitch * 0.04);
+        state.alt += (state.pitch * 0.15);
+        state.hdg = (state.hdg + state.roll * 0.04 + 360) % 360;
+
+        // E. 坠机判定逻辑
+        if (state.alt <= 0 && (state.speed > 60 || Math.abs(state.pitch) > 10)) {
+            doCrash();
+        }
+        if (Math.abs(state.pitch) > 88) doCrash(); // 彻底失速翻转判定
+
+        renderPFD();
+        updateUI();
+        monitorSafety();
+        requestAnimationFrame(physicsEngine);
+    }
+
+    // --- 3. 姿态绘图 (精密版) ---
+    function renderPFD() {
+        const cx = 300, cy = 300;
+        ctx.clearRect(0,0,600,600);
+
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(-state.roll * Math.PI / 180);
+
+        const pOff = state.pitch * 10;
+        
+        // 天空
+        let skyGrd = ctx.createLinearGradient(0, -600+pOff, 0, pOff);
+        skyGrd.addColorStop(0, '#1e528e'); skyGrd.addColorStop(1, '#3399ff');
+        ctx.fillStyle = skyGrd;
+        ctx.fillRect(-1200, -1200 + pOff, 2400, 1200);
+
+        // 大地
+        let gndGrd = ctx.createLinearGradient(0, pOff, 0, 600+pOff);
+        gndGrd.addColorStop(0, '#5a3a1a'); gndGrd.addColorStop(1, '#1a0d00');
+        ctx.fillStyle = gndGrd;
+        ctx.fillRect(-1200, pOff, 2400, 1200);
+
+        // 刻度
+        ctx.strokeStyle = "rgba(255,255,255,0.5)";
+        ctx.lineWidth = 2;
+        ctx.fillStyle = "white";
+        ctx.textAlign = "center";
+        for(let i=-90; i<=90; i+=10) {
+            if(i === 0) continue;
+            let y = pOff - (i * 10);
+            ctx.beginPath();
+            let w = (i%20===0) ? 80 : 40;
+            ctx.moveTo(-w, y); ctx.lineTo(w, y);
+            ctx.stroke();
+            ctx.fillText(i, w+20, y+5);
+        }
+        ctx.restore();
+
+        // 固定参照：飞机符号
+        ctx.strokeStyle = "#ffff00";
+        ctx.lineWidth = 6;
+        ctx.beginPath();
+        ctx.moveTo(cx-140, cy); ctx.lineTo(cx-60, cy); ctx.lineTo(cx-60, cy+30);
+        ctx.moveTo(cx+140, cy); ctx.lineTo(cx+60, cy); ctx.lineTo(cx+60, cy+30);
+        ctx.stroke();
+        ctx.fillStyle = "#ffff00";
+        ctx.fillRect(cx-5, cy-5, 10, 10);
+    }
+
+    // --- 4. 警报音效逻辑 ---
+    function playAlarmTone(freq, dur) {
+        if (!audioCtx || state.mute) return;
+        
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        
+        osc.type = 'square'; // 方波声音最响亮
+        osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+        
+        gain.connect(audioCtx.destination);
+        osc.connect(gain);
+        
+        gain.gain.setValueAtTime(0, audioCtx.currentTime);
+        gain.gain.linearRampToValueAtTime(0.15, audioCtx.currentTime + 0.05);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + dur);
+        
+        osc.start();
+        osc.stop(audioCtx.currentTime + dur);
+    }
+
+    function monitorSafety() {
+        const isCritical = Math.abs(state.pitch) > 45 || Math.abs(state.roll) > 60;
+        const ui = document.getElementById('master-warn');
+        
+        if (isCritical) {
+            ui.style.display = 'block';
+            // 每400ms响一次警报
+            if (Math.floor(Date.now() / 400) % 2 === 0) {
+                playAlarmTone(880, 0.2); // 高频 A
+            }
+        } else {
+            ui.style.display = 'none';
+        }
+    }
+
+    // --- 5. 辅助功能 ---
+    function handleGyro(e) {
+        if(state.hasPad) return;
+        state.pitch = (e.beta - 45 - state.trimP);
+        state.roll = (e.gamma - state.trimR);
+        state.hdg = e.webkitCompassHeading || (360 - e.alpha);
+    }
+
+    function updateUI() {
+        document.getElementById('ui-alt').innerText = Math.max(0, state.alt).toFixed(0);
+        document.getElementById('ui-speed').innerText = Math.max(0, state.speed).toFixed(1);
+        document.getElementById('ui-hdg').innerText = Math.round(state.hdg).toString().padStart(3,'0');
+        document.getElementById('ui-pitch').innerText = state.pitch.toFixed(1);
+        document.getElementById('ui-roll').innerText = state.roll.toFixed(1);
+    }
+
+    function calibrate() {
+        state.trimP = state.pitch + state.trimP;
+        state.trimR = state.roll + state.trimR;
+    }
+
+    function doCrash() {
+        state.isCrashed = true;
+        document.getElementById('crash-overlay').style.display = 'flex';
+        playAlarmTone(100, 1.0); // 坠毁低频音
+    }
+</script>
+</body>
+</html>
