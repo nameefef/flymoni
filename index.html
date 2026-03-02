@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>Elite Avionics System</title>
+    <style>
+        :root { --neon: #00ff66; --warn: #ff3300; --panel: #121214; }
+        body { margin: 0; background: #000; color: #fff; font-family: 'Consolas', 'Courier New', monospace; display: flex; height: 100vh; overflow: hidden; }
+        
+        /* 侧边数据栏 */
+        #sidebar { width: 260px; background: var(--panel); border-right: 2px solid #222; display: flex; flex-direction: column; padding: 20px; box-sizing: border-box; z-index: 10; }
+        .data-box { background: rgba(255,255,255,0.03); border: 1px solid #333; padding: 12px; margin-bottom: 12px; border-radius: 4px; border-left: 3px solid #444; }
+        .data-box.active { border-left-color: var(--neon); }
+        .label { font-size: 10px; color: #888; text-transform: uppercase; margin-bottom: 4px; letter-spacing: 1px; }
+        .value { font-size: 24px; color: var(--neon); font-weight: 300; }
+        .unit { font-size: 12px; color: #444; margin-left: 4px; }
+
+        /* 主视口 */
+        #viewport { flex-grow: 1; position: relative; display: flex; align-items: center; justify-content: center; background: radial-gradient(circle, #151515 0%, #000 100%); }
+        canvas { border: 2px solid #333; border-radius: 8px; box-shadow: 0 0 50px #000; max-width: 95vw; max-height: 95vw; }
+
+        /* 警报系统 */
+        #master-warn { position: absolute; top: 12%; background: var(--warn); color: #fff; padding: 12px 50px; font-weight: 900; font-size: 24px; border: 2px solid #fff; display: none; animation: blink 0.4s infinite; z-index: 100; box-shadow: 0 0 30px rgba(255,0,0,0.5); }
+        
+        /* 坠毁黑匣子界面 */
+        #crash-screen { position: absolute; inset: 0; background: rgba(40, 0, 0, 0.95); display: none; flex-direction: column; align-items: center; justify-content: center; z-index: 200; backdrop-filter: blur(15px); }
+        .black-box { background: #000; padding: 25px; border: 1px solid var(--warn); border-radius: 8px; margin-top: 20px; min-width: 300px; text-align: left; line-height: 1.6; }
+        .black-box h3 { color: var(--warn); margin-top: 0; border-bottom: 1px solid #333; padding-bottom: 10px; }
+
+        /* 底部控制 */
+        #controls { position: absolute; bottom: 30px; display: flex; gap: 10px; }
+        button { background: #222; color: #eee; border: 1px solid #444; padding: 12px 25px; cursor: pointer; border-radius: 5px; font-size: 13px; font-weight: bold; transition: 0.2s; }
+        button:hover { border-color: var(--neon); color: var(--neon); }
+        .btn-main { background: var(--neon); color: #000; border: none; }
+
+        @keyframes blink { 50% { opacity: 0; } }
+        @media (max-width: 768px) { #sidebar { display: none; } } /* 手机端隐藏侧边栏以腾出空间 */
+    </style>
+</head>
+<body>
+
+<div id="sidebar">
+    <div style="font-size: 12px; color: #666; margin-bottom: 25px; letter-spacing: 2px;">FLIGHT TELEMETRY</div>
+    <div class="data-box active"><div class="label">ALT (BEIDOU/GPS)</div><div class="value"><span id="ui-alt">0</span><span class="unit">M</span></div></div>
+    <div class="data-box active"><div class="label">SPD (GROUND)</div><div class="value"><span id="ui-speed">0.0</span><span class="unit">KT</span></div></div>
+    <div class="data-box"><div class="label">MAGNETIC HDG</div><div class="value"><span id="ui-hdg">000</span><span class="unit">°</span></div></div>
+    <div class="data-box"><div class="label">PITCH ATTITUDE</div><div class="value" id="ui-pitch">0.0<span class="unit">°</span></div></div>
+    <div class="data-box"><div class="label">ROLL BANK</div><div class="value" id="ui-roll">0.0<span class="unit">°</span></div></div>
+    <div style="margin-top: auto; font-size: 10px; color: #333;">FDR STATUS: RECORDING...</div>
+</div>
+
+<div id="viewport">
+    <div id="master-warn">WARNING: TERRAIN</div>
+    
+    <div id="crash-screen">
+        <h1 style="font-size: 60px; margin: 0; color: #fff;">SYSTEM FAILURE</h1>
+        <div class="black-box" id="fdr-data">
+            <h3>FDR - 黑匣子最后记录</h3>
+            </div>
+        <button onclick="location.reload()" class="btn-main" style="margin-top: 30px;">REBOOT SYSTEM</button>
+    </div>
+
+    <canvas id="pfd" width="600" height="600"></canvas>
+
+    <div id="controls">
+        <button class="btn-main" onclick="startApp()">启动飞行系统</button>
+        <button onclick="calibrate()">姿态配平</button>
+    </div>
+</div>
+
+<script>
+    const canvas = document.getElementById('pfd');
+    const ctx = canvas.getContext('2d');
+    
+    let state = {
+        pitch: 0, roll: 0, hdg: 0,
+        vP: 0, vR: 0,
+        speed: 150, alt: 2000,
+        trimP: 0, trimR: 0,
+        isCrashed: false,
+        startTime: Date.now()
+    };
+
+    let audioCtx;
+
+    async function startApp() {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') await audioCtx.resume();
+        
+        // 传感器授权 (iOS/Android)
+        if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+            const res = await DeviceOrientationEvent.requestPermission();
+            if (res === 'granted') window.addEventListener('deviceorientation', e => {
+                state.pitch = e.beta - 45 - state.trimP;
+                state.roll = e.gamma - state.trimR;
+                state.hdg = e.webkitCompassHeading || (360 - e.alpha);
+            });
+        } else {
+            window.addEventListener('deviceorientation', e => {
+                state.pitch = e.beta - 45 - state.trimP;
+                state.roll = e.gamma - state.trimR;
+            });
+        }
+
+        // 北斗/GPS 高精度定位
+        navigator.geolocation.watchPosition(p => {
+            state.speed = (p.coords.speed || 0) * 1.943;
+            state.alt = p.coords.altitude || state.alt;
+        }, null, { enableHighAccuracy: true });
+
+        requestAnimationFrame(loop);
+    }
+
+    function loop() {
+        if (state.isCrashed) return;
+
+        // --- 真实反馈物理 ---
+        let turb = (Math.random() - 0.5) * 0.1; // 气流微颤
+        state.vP += turb + (-state.pitch * 0.012); // 稳定性
+        state.vR += turb + 0.015; // 发动机扭矩
+        state.vP *= 0.96; state.vR *= 0.95;
+        state.pitch += state.vP; state.roll += state.vR;
+
+        // 动能交换
+        state.alt += (state.pitch * -0.2);
+        state.speed -= (state.pitch * 0.06);
+        state.hdg = (state.hdg + state.roll * 0.04 + 360) % 360;
+
+        // --- 坠机逻辑判定 ---
+        if (state.alt <= 0 && (state.speed > 70 || Math.abs(state.pitch) > 15)) {
+            crash("地表剧烈撞击 (CFIT)");
+        } else if (Math.abs(state.pitch) > 85 || Math.abs(state.roll) > 100) {
+            crash("由于过载机体结构解体");
+        }
+
+        draw();
+        updateUI();
+        checkAudio();
+        requestAnimationFrame(loop);
+    }
+
+    function crash(reason) {
+        state.isCrashed = true;
+        const screen = document.getElementById('crash-screen');
+        const fdr = document.getElementById('fdr-data');
+        screen.style.display = 'flex';
+        fdr.innerHTML = `
+            <h3>FDR - 事故调查分析</h3>
+            <div>原因: ${reason}</div>
+            <div>撞击空速: ${state.speed.toFixed(1)} KT</div>
+            <div>最后姿态: P:${state.pitch.toFixed(1)}° / R:${state.roll.toFixed(1)}°</div>
+            <div>飞行时长: ${((Date.now() - state.startTime)/1000).toFixed(1)}s</div>
+        `;
+        playExplosion();
+    }
+
+    function draw() {
+        const cx = 300, cy = 300;
+        ctx.clearRect(0,0,600,600);
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(-state.roll * Math.PI / 180);
+        const pOff = state.pitch * 10;
+        
+        // 天地线
+        ctx.fillStyle = "#1e90ff"; ctx.fillRect(-1200, -1200 + pOff, 2400, 1200);
+        ctx.fillStyle = "#5a3a1a"; ctx.fillRect(-1200, pOff, 2400, 1200);
+
+        // 刻度
+        ctx.strokeStyle = "rgba(255,255,255,0.4)"; ctx.lineWidth = 2; ctx.fillStyle = "#fff";
+        for(let i=-90; i<=90; i+=10) {
+            if(i===0) continue;
+            let y = pOff - (i*10);
+            ctx.beginPath(); ctx.moveTo(-60, y); ctx.lineTo(60, y); ctx.stroke();
+            ctx.fillText(i, 80, y+5);
+        }
+        ctx.restore();
+
+        // 固定机体符号
+        ctx.strokeStyle = "#ffff00"; ctx.lineWidth = 6; ctx.beginPath();
+        ctx.moveTo(cx-140, cy); ctx.lineTo(cx-60, cy); ctx.lineTo(cx-60, cy+30);
+        ctx.moveTo(cx+140, cy); ctx.lineTo(cx+60, cy); ctx.lineTo(cx+60, cy+30);
+        ctx.stroke();
+        ctx.fillStyle = "#ffff00"; ctx.fillRect(cx-5, cy-5, 10, 10);
+    }
+
+    function playAlarm() {
+        if (!audioCtx) return;
+        const o = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        o.type = 'square'; o.frequency.value = 880;
+        g.connect(audioCtx.destination); o.connect(g);
+        g.gain.setTargetAtTime(0.1, audioCtx.currentTime, 0.01);
+        g.gain.setTargetAtTime(0, audioCtx.currentTime + 0.1, 0.01);
+        o.start(); o.stop(audioCtx.currentTime + 0.2);
+    }
+
+    function playExplosion() {
+        const o = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        o.type = 'sawtooth'; o.frequency.value = 50;
+        g.connect(audioCtx.destination); o.connect(g);
+        g.gain.setValueAtTime(0.5, audioCtx.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 1);
+        o.start(); o.stop(audioCtx.currentTime + 1);
+    }
+
+    function checkAudio() {
+        if (state.alt < 500 || Math.abs(state.pitch) > 35) {
+            document.getElementById('master-warn').style.display = 'block';
+            if (Math.floor(Date.now()/400)%2 === 0) playAlarm();
+        } else {
+            document.getElementById('master-warn').style.display = 'none';
+        }
+    }
+
+    function updateUI() {
+        document.getElementById('ui-alt').innerText = Math.max(0, state.alt).toFixed(0);
+        document.getElementById('ui-speed').innerText = Math.max(0, state.speed).toFixed(1);
+        document.getElementById('ui-hdg').innerText = Math.round(state.hdg).toString().padStart(3,'0');
+        document.getElementById('ui-pitch').innerText = state.pitch.toFixed(1);
+        document.getElementById('ui-roll').innerText = state.roll.toFixed(1);
+    }
+    function calibrate() { state.trimP = state.pitch + state.trimP; state.trimR = state.roll + state.trimR; }
+</script>
+</body>
+</html>
